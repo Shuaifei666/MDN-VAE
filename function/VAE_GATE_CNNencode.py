@@ -179,21 +179,14 @@ with torch.no_grad():
     recon_samples = recon_samples.cpu()
     sample = sample.cpu()
 
-    # 将 sample 和 recon_samples 转换为 NumPy 数组
     sample_np = sample.numpy()
     recon_samples_np = recon_samples.numpy()
 
-    # 遍历每个样本
     for i in range(len(recon_samples)):
-        # 保存潜在向量
         latent_vector = sample_np[i]
         np.savetxt(f'results/latent_vector_{i}.csv', latent_vector, delimiter=',')
-
-        # 保存重构样本
         reconstructed_sample = recon_samples_np[i]
         np.savetxt(f'results/reconstructed_sample_{i}.csv', reconstructed_sample, delimiter=',')
-
-        # 保存图像
         plt.imshow(reconstructed_sample.reshape(68, 68))
         plt.axis('off')
         plt.savefig(f'results/sample_{i}.png')
