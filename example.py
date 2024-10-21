@@ -42,7 +42,7 @@ else:
     print ("Successfully created the directory %s " % results_path)
 
 ###Run unsuperived GATE with GATE.py output pca plot and some generated networks
-os.system('python3 function/VAE_GATE_CNNencode.py')
+os.system('python3 function/VAE_Gate_finished.py')
 
 # ###Run superived GATE with reGATE_gen.py for prediction
 # os.system('python3 functions/reGATE_pred.py')
