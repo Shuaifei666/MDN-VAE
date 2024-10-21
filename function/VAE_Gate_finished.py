@@ -33,7 +33,6 @@ for i in range(tensor.shape[3]):
     ith = np.float32(tensor[:, :, 0, i] + np.transpose(tensor[:, :, 0, i]))
     np.fill_diagonal(ith, np.mean(ith, axis=0))
     ith = ith[18:86, 18:86]
-    # Normalize data to the [0, 1] range
     ith = (ith - ith.min()) / (ith.max() - ith.min())
     ith = ith.flatten()
     net_data.append(ith)
@@ -42,7 +41,7 @@ batch_size = 5
 
 # Convert network data to PyTorch tensors
 tensor_y = torch.stack([torch.Tensor(i) for i in net_data])
-y = utils.TensorDataset(tensor_y)  # Create the dataset
+y = utils.TensorDataset(tensor_y) 
 
 # Create DataLoader
 train_loader = utils.DataLoader(tensor_y, batch_size=batch_size, shuffle=True)
@@ -69,7 +68,7 @@ class VAE(nn.Module):
     def __init__(self):
         super(VAE, self).__init__()
         latent_dim = 16  # Latent space dimension
-        self.latent_dim = latent_dim  # Store for later use
+        self.latent_dim = latent_dim  
 
         ### Parameters for the encoder structure
         input_nc = 1  # Number of input channels
@@ -98,7 +97,7 @@ class VAE(nn.Module):
             nn.InstanceNorm2d(init_depth * 4 - s_depth),
             nn.ReLU(inplace=True)
         ]
-        in_features = init_depth * 4 - s_depth  # in_features = 64
+        in_features = init_depth * 4 - s_depth  
 
         # Residual blocks
         for _ in range(n_residual_blocks):
@@ -128,7 +127,7 @@ class VAE(nn.Module):
         self.encoder_fc_mu = nn.Linear(in_features * self.z_size * self.z_size, latent_dim)
         self.encoder_fc_logvar = nn.Linear(in_features * self.z_size * self.z_size, latent_dim)
 
-        ### Decoder (Same as before)
+        ### Decoder 
         self.decoder_fc1 = nn.Linear(latent_dim, 1024)
         self.decoder_fc2 = nn.Linear(1024, 64 * 9 * 9)
         self.decoder_conv1 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1)
@@ -147,7 +146,6 @@ class VAE(nn.Module):
         # Flatten the output
         batch_size, channels, height, width = h.size()
         h = h.view(batch_size, -1)
-        # Adjust input size of fc layers if necessary
         if not hasattr(self, 'encoder_fc_mu'):
             self.encoder_fc_mu = nn.Linear(channels * height * width, self.latent_dim).to(x.device)
             self.encoder_fc_logvar = nn.Linear(channels * height * width, self.latent_dim).to(x.device)
@@ -174,7 +172,7 @@ class VAE(nn.Module):
         h = F.relu(self.decoder_conv2(h))      # (batch_size, 16, 33, 33)
         h = self.decoder_conv3(h)              # (batch_size, 1, 65, 65)
         h = torch.sigmoid(h)                   # Limit the output to [0, 1]
-        h = F.interpolate(h, size=(68, 68), mode='bilinear', align_corners=False)  # Resize to original dimensions
+        h = F.interpolate(h, size=(68, 68), mode='bilinear', align_corners=False)  
         h = h.view(-1, 68 * 68)                # Flatten the output
         return h, z
 
@@ -194,11 +192,9 @@ def loss_function(recon_x, x, mu, logvar):
     """
     # Use Mean Squared Error loss
     MSE = F.mse_loss(recon_x, x.view(-1, 68 * 68), reduction='sum')
-    # KL divergence
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    # Adjust the weight of KL divergence
-    beta = 1.0
-    return MSE + beta * KLD
+    # beta = 1.0
+    return MSE + KLD
 
 # Define the training function
 def train(epoch):
@@ -226,7 +222,7 @@ def test(epoch):
     model.eval()
     test_loss = 0
     with torch.no_grad():
-        for i, data in enumerate(train_loader):  # Ideally, use a separate test_loader
+        for i, data in enumerate(train_loader): 
             data = data.to(device)
             recon_batch, mu, logvar, _ = model(data)
             test_loss += loss_function(recon_batch, data, mu, logvar).item()
@@ -240,7 +236,7 @@ model = VAE().to(device)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 # Training loop
-num_epochs = 200
+num_epochs = 100
 for epoch in range(1, num_epochs + 1):
     train(epoch)
     test(epoch)
@@ -260,7 +256,7 @@ with torch.no_grad():
         np.savetxt(f'results/latent_vector_{i}.csv', latent_vector, delimiter=',')
         reconstructed_sample = recon_samples_np[i]
         np.savetxt(f'results/reconstructed_sample_{i}.csv', reconstructed_sample, delimiter=',')
-        plt.imshow(reconstructed_sample.reshape(68, 68), cmap='gray')
+        plt.imshow(reconstructed_sample.reshape(68, 68))
         plt.axis('off')
         plt.savefig(f'results/sample_{i}.png')
         plt.close()
