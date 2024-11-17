@@ -133,12 +133,10 @@ class VAE(nn.Module):
         self.fc33 = nn.Linear(latent_dim, 68)
         self.fc34 = nn.Linear(latent_dim, 68)
         self.fc35 = nn.Linear(latent_dim, 68)
-        self.fc4 = GraphCNN(68, 68)
-        self.fc5 = GraphCNN(68, 68)
-        self.fc6 = GraphCNN(68, 68)
-        self.fc7 = GraphCNN(68, 68)
-        self.fc8 = GraphCNN(68, 68)
-        self.fcintercept = GraphCNN(68 * 68, 68 * 68)
+        self.fc4 = nn.Linear(68,68)
+        self.fc5 = nn.Linear(68,68)
+       
+        self.fcintercept = nn.Linear(68*68, 68*68)
 
     def encode(self, x):
         x = x.view(-1, 1, 68, 68)  
@@ -155,25 +153,25 @@ class VAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z):
-        h31 = torch.sigmoid(self.fc3(z))
-        h31 = torch.sigmoid(self.fc4(h31))
+        h31= F.sigmoid(self.fc3(z))
+        h31= F.sigmoid(self.fc4(h31))
         h31_out = torch.bmm(h31.unsqueeze(2), h31.unsqueeze(1))
-        h32 = torch.sigmoid(self.fc32(z))
-        h32 = torch.sigmoid(self.fc5(h32))
+        h32 = F.sigmoid(self.fc32(z))
+        h32 = F.sigmoid(self.fc5(h32))
         h32_out = torch.bmm(h32.unsqueeze(2), h32.unsqueeze(1))
-        h33 = torch.sigmoid(self.fc33(z))
-        h33 = torch.sigmoid(self.fc6(h33))
+        h33 = F.sigmoid(self.fc33(z))
+        h33 = F.sigmoid(self.fc5(h33))
         h33_out = torch.bmm(h33.unsqueeze(2), h33.unsqueeze(1))
-        h34 = torch.sigmoid(self.fc34(z))
-        h34 = torch.sigmoid(self.fc7(h34))
+        h34 = F.sigmoid(self.fc34(z))
+        h34 = F.sigmoid(self.fc5(h34))
         h34_out = torch.bmm(h34.unsqueeze(2), h34.unsqueeze(1))
-        h35 = torch.sigmoid(self.fc35(z))
-        h35 = torch.sigmoid(self.fc8(h35))
+        h35 = F.sigmoid(self.fc35(z))
+        h35 = F.sigmoid(self.fc5(h35))
         h35_out = torch.bmm(h35.unsqueeze(2), h35.unsqueeze(1))
-        h30 = torch.sigmoid(h31_out + h32_out + h33_out + h34_out + h35_out)
-        h30 = h30.view(-1, 68 * 68)
+        h30 = h31_out + h32_out + h33_out + h34_out + h35_out
+        h30 = h30.view(-1, 68*68)
         h30 = self.fcintercept(h30)
-        return h30.view(-1, 68 * 68), h31 + h32 + h33 + h34
+        return h30.view(-1, 68*68), h31+h32+h33
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -181,13 +179,13 @@ class VAE(nn.Module):
         recon, x_latent = self.decode(z)
         return recon.view(-1, 68 * 68), mu, logvar, x_latent
 
-    def set_mask(self, masks):
-        self.fc4.set_mask(masks[0])
-        self.fc5.set_mask(masks[1])
-        self.fc6.set_mask(masks[2])
-        self.fc7.set_mask(masks[3])
-        self.fc8.set_mask(masks[4])
-        self.fcintercept.set_mask(masks[5])
+    # def set_mask(self, masks):
+    #     self.fc4.set_mask(masks[0])
+    #     self.fc5.set_mask(masks[1])
+    #     self.fc6.set_mask(masks[2])
+    #     self.fc7.set_mask(masks[3])
+    #     self.fc8.set_mask(masks[4])
+    #     self.fcintercept.set_mask(masks[5])
 
 def loss_function(recon_x, x, mu, logvar):
     # BCE = F.mse_loss(recon_x,x , reduction='sum')
@@ -235,7 +233,7 @@ mask_32NN = (np.argsort(np.argsort(A_mat, axis=-1), axis=-1) < n_size + 1)
 masks.append(torch.from_numpy(np.float32(mask_32NN)).float())
 mask_intercept = np.identity(68 * 68)
 masks.append(torch.from_numpy(np.float32(mask_intercept)).float())
-model.set_mask(masks)
+# model.set_mask(masks)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 batch_size = 256
 learning_rate = 0.001
@@ -249,6 +247,6 @@ with torch.no_grad():
     sample = sample.cpu()
     for i in range(len(sample)):
         plt.imshow(sample[i].reshape(68, 68))
-        plt.savefig('results/{}.png'.format(i))
+        plt.savefig('results/fnn{}.png'.format(i))
 
 torch.cuda.empty_cache()

@@ -1,140 +1,143 @@
 from __future__ import print_function
+import argparse
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
+from torchvision import datasets, transforms
+from tqdm import tqdm
 from scipy.io import loadmat
+from torch.autograd import Variable
 import numpy as np
 import torch.utils.data as utils
-import matplotlib.pyplot as plt
+from torchvision.utils import save_image
 
-# Remove the random seed setting to allow generating diverse samples
-torch.manual_seed(11111)
 
-# Check if GPU is available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda")
 
-### Load the dataset
-dat_mat = loadmat('./data/HCP_samples.mat')
+
+def to_var(x, requires_grad=False, volatile=False):
+    """
+    Varialbe type that automatically choose cpu or cuda
+    """
+    if torch.cuda.is_available():
+        x = x.cuda()
+    return Variable(x, requires_grad=requires_grad, volatile=volatile)
+
+class GraphCNN(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphCNN, self).__init__(in_features, out_features, bias)
+        self.mask_flag = False
+    def set_mask(self, mask):
+        self.mask = to_var(mask, requires_grad=False)
+        self.weight.data = self.weight.data*self.mask.data
+        self.mask_flag = True 
+    def get_mask(self):
+        print(self.mask_flag)
+        return self.mask
+    def forward(self, x):
+        if self.mask_flag == True:
+            weight = self.weight*self.mask
+            return F.linear(x, weight, self.bias)
+        else:
+            return F.linear(x, self.weight, self.bias)
+
+dat_mat = loadmat('./data/HCP_subcortical_CMData_desikan.mat')
 tensor = dat_mat['loaded_tensor_sub']
-
-### Load and process the adjacency matrix
-A_mat = np.mean(np.squeeze(tensor[18:86, 18:86, 1, :]), axis=2)
+A_mat = np.mean(np.squeeze(tensor[:,:,1,:]), axis=2)
 A_mat = A_mat + A_mat.transpose()
+# A_mat[np.where(A_mat==0)] = 256
 
-### Set the loss function type
-loss_type = "MSE"
 
-### Set the neighborhood size for GATE
-n_size = 32
-
-### Load network data and preprocess
-net_data = []
-for i in range(tensor.shape[3]):
-    ith = np.float32(tensor[:, :, 0, i] + np.transpose(tensor[:, :, 0, i]))
-    np.fill_diagonal(ith, np.mean(ith, axis=0))
-    ith = ith[18:86, 18:86]
-    # Normalize data to the [0, 1] range
-    ith = (ith - ith.min()) / (ith.max() - ith.min())
-    ith = ith.flatten()
-    net_data.append(ith)
-
-batch_size = 5
-
-# Convert network data to PyTorch tensors
-tensor_y = torch.stack([torch.Tensor(i) for i in net_data])
-y = utils.TensorDataset(tensor_y)  # Create the dataset
-
-# Create DataLoader
-train_loader = utils.DataLoader(tensor_y, batch_size=batch_size, shuffle=True)
-
-# Define the VAE model
 class VAE(nn.Module):
     def __init__(self):
         super(VAE, self).__init__()
-        latent_dim = 16  # Increase the latent space dimension
-
-        ### Encoder
-        self.encoder_conv1 = nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1)   # (1,68,68) -> (16,34,34)
-        self.encoder_conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)  # (16,34,34) -> (32,17,17)
-        self.encoder_conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)  # (32,17,17) -> (64,9,9)
-        self.encoder_fc1 = nn.Linear(64 * 9 * 9, 1024)
-        self.encoder_fc_mu = nn.Linear(1024, latent_dim)
-        self.encoder_fc_logvar = nn.Linear(1024, latent_dim)
-
-        ### Decoder (Fully Connected Network)
-        self.decoder_fc1 = nn.Linear(latent_dim, 1024)
-        self.decoder_fc2 = nn.Linear(1024, 64 * 9 * 9)
-        self.decoder_conv1 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.decoder_conv2 = nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.decoder_conv3 = nn.ConvTranspose2d(16, 1, kernel_size=3, stride=2, padding=1, output_padding=1)
-
+        latent_dim = 87
+        self.fc1 = nn.Linear(87*87, 256)
+        self.fc21 = nn.Linear(256, latent_dim)
+        self.fc22 = nn.Linear(256, latent_dim)
+        self.fc3 = nn.Linear(latent_dim, 87)
+        self.fc32 = nn.Linear(latent_dim,87)
+        self.fc33 = nn.Linear(latent_dim,87)
+        self.fc34 = nn.Linear(latent_dim,87)
+        self.fc35 = nn.Linear(latent_dim,87)
+        self.fc4 = nn.Linear(87,87)
+        self.fc5 = nn.Linear(87,87)
+        self.fc6 = nn.Linear(87,87)
+        # self.fcintercept = nn.Linear(87*87, 87*87)
     def encode(self, x):
-        """
-        Encoder: Encodes the input data into latent variables (mu and logvar)
-        """
-        x = x.view(-1, 1, 68, 68)
-        h = F.relu(self.encoder_conv1(x))  # (16,34,34)
-        h = F.relu(self.encoder_conv2(h))  # (32,17,17)
-        h = F.relu(self.encoder_conv3(h))  # (64,9,9)
-        h = h.view(-1, 64 * 9 * 9)
-        h = F.relu(self.encoder_fc1(h))    # (batch_size, 1024)
-        mu = self.encoder_fc_mu(h)         # (batch_size, latent_dim)
-        logvar = self.encoder_fc_logvar(h) # (batch_size, latent_dim)
-        return mu, logvar
-
+        h1 = F.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
     def reparameterize(self, mu, logvar):
-        """
-        Reparameterization trick to sample z from N(mu, var)
-        """
-        std = torch.exp(0.5 * logvar)
+        std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
-        return mu + eps * std
-
+        return mu + eps*std
     def decode(self, z):
-        """
-        Decoder: Decodes the latent variable z back to the original data space
-        """
-        h = F.relu(self.decoder_fc1(z))        # (batch_size, 1024)
-        h = F.relu(self.decoder_fc2(h))        # (batch_size, 64*9*9)
-        h = h.view(-1, 64, 9, 9)               # (batch_size, 64, 9, 9)
-        h = F.relu(self.decoder_conv1(h))      # (batch_size, 32, 17, 17)
-        h = F.relu(self.decoder_conv2(h))      # (batch_size, 16, 33, 33)
-        h = self.decoder_conv3(h)              # (batch_size, 1, 65, 65)
-        h = torch.sigmoid(h)                   # Limit the output to [0, 1]
-        h = F.interpolate(h, size=(68, 68), mode='bilinear', align_corners=False)  # Resize to original dimensions
-        h = h.view(-1, 68 * 68)                # Flatten the output
-        return h, z
-
+        h31= F.sigmoid(self.fc3(z))
+        h31= F.sigmoid(self.fc4(h31))
+        h31_out = torch.bmm(h31.unsqueeze(2), h31.unsqueeze(1))
+        h32 = F.sigmoid(self.fc32(z))
+        h32 = F.sigmoid(self.fc5(h32))
+        h32_out = torch.bmm(h32.unsqueeze(2), h32.unsqueeze(1))
+        h33 = F.sigmoid(self.fc33(z))
+        h33 = F.sigmoid(self.fc5(h33))
+        h33_out = torch.bmm(h33.unsqueeze(2), h33.unsqueeze(1))
+        h34 = F.sigmoid(self.fc34(z))
+        h34 = F.sigmoid(self.fc5(h34))
+        h34_out = torch.bmm(h34.unsqueeze(2), h34.unsqueeze(1))
+        h35 = F.sigmoid(self.fc35(z))
+        h35 = F.sigmoid(self.fc5(h35))
+        h35_out = torch.bmm(h35.unsqueeze(2), h35.unsqueeze(1))
+        h30 = h31_out + h32_out + h33_out + h34_out + h35_out
+        h30 = h30.view(-1, 87*87)
+        # h30 = self.fcintercept(h30)
+        return h30.view(-1, 87*87), h31+h32+h33
     def forward(self, x):
-        """
-        Forward pass through the VAE
-        """
-        mu, logvar = self.encode(x)
+        mu, logvar = self.encode(x.view(-1, 87*87))
         z = self.reparameterize(mu, logvar)
-        recon_x, z = self.decode(z)
-        return recon_x, mu, logvar, z
+        recon, x_latent = self.decode(z)
+        return recon.view(-1, 87*87), mu, logvar, x_latent
 
-# Define the loss function
+
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+model = VAE().to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+batch_size = 256
+learning_rate=0.001
+
+net_data = []
+for i in range(tensor.shape[3]):
+    ith = np.float32(tensor[:,:,1,i] + np.transpose(tensor[:,:,1,i]))
+    # ith[np.where(ith<=20)] = 0
+    # ith[np.where(ith> 20)] = 1
+    np.fill_diagonal(ith,np.mean(ith, 0))
+    ith = ith.flatten()
+    ith = np.log(ith+1)
+    net_data.append(ith)
+
+tensor_y = torch.stack([torch.Tensor(i) for i in net_data])
+y = utils.TensorDataset(tensor_y) # create your datset
+train_loader = utils.DataLoader(net_data, batch_size) 
+
+
+
 def loss_function(recon_x, x, mu, logvar):
-    """
-    Compute the VAE loss function as the sum of reconstruction loss and KL divergence
-    """
-    # Use Mean Squared Error loss
-    MSE = F.mse_loss(recon_x, x.view(-1, 68 * 68), reduction='sum')
-    # KL divergence
+    # BCE = F.binary_cross_entropy(recon_x, x , reduction='sum')
+    BCE = F.poisson_nll_loss(recon_x , x, reduction='sum', log_input=True)
+    # see Appendix B from VAE paper:
+    # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
+    # https://arxiv.org/abs/1312.6114
+    # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    # Adjust the weight of KL divergence
-    beta = 1.0
-    return MSE + beta * KLD
+    return BCE + KLD
 
-# Define the training function
+
+
 def train(epoch):
-    """
-    Train the VAE model for one epoch
-    """
     model.train()
     train_loss = 0
-    for batch_idx, data in enumerate(train_loader):
+    for batch_idx, (data) in enumerate(train_loader):
         data = data.to(device)
         optimizer.zero_grad()
         recon_batch, mu, logvar, _ = model(data)
@@ -142,54 +145,65 @@ def train(epoch):
         loss.backward()
         train_loss += loss.item()
         optimizer.step()
-    average_loss = train_loss / len(train_loader.dataset)
-    print(f'====> Epoch: {epoch} Average loss: {average_loss:.4f}')
+    print('====> Epoch: {} Average loss: {:.4f}'.format(
+          epoch, train_loss / len(train_loader.dataset)))
 
-# Define the testing function
+
 def test(epoch):
-    """
-    Evaluate the VAE model on the test set
-    """
     model.eval()
     test_loss = 0
     with torch.no_grad():
-        for i, data in enumerate(train_loader):  # Ideally, use a separate test_loader
+        for i, (data) in enumerate(train_loader):
             data = data.to(device)
-            recon_batch, mu, logvar, _ = model(data)
+            recon_batch, mu, logvar = model(data)
             test_loss += loss_function(recon_batch, data, mu, logvar).item()
     test_loss /= len(train_loader.dataset)
-    print(f'====> Test set loss: {test_loss:.4f}')
+    print('====> Test set loss: {:.4f}'.format(test_loss))
 
-# Initialize the VAE model
-model = VAE().to(device)
 
-# Define the optimizer
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-# Training loop
-num_epochs = 200
-for epoch in range(1, num_epochs + 1):
+for epoch in range(5000):
     train(epoch)
-    test(epoch)
+    with torch.no_grad():
+        sample = torch.randn(16, 87).to(device)
+        sample = model.decode(sample)[0].cpu()
+        save_image(sample.view(16, 1, 87, 87),'results/sample_{}.png'.format(epoch))
 
-# Generate and save samples after training
-with torch.no_grad():
-    sample = torch.randn(10, 16).to(device)
-    recon_samples, _ = model.decode(sample)
-    recon_samples = recon_samples.cpu()
-    sample = sample.cpu()
 
-    sample_np = sample.numpy()
-    recon_samples_np = recon_samples.numpy()
 
-    for i in range(len(recon_samples)):
-        latent_vector = sample_np[i]
-        np.savetxt(f'results/latent_vector_{i}.csv', latent_vector, delimiter=',')
-        reconstructed_sample = recon_samples_np[i]
-        np.savetxt(f'results/reconstructed_sample_{i}.csv', reconstructed_sample, delimiter=',')
-        plt.imshow(reconstructed_sample.reshape(68, 68))
-        plt.axis('off')
-        plt.savefig(f'results/sample_{i}.png')
-        plt.close()
-# Clear the CUDA cache
+
 torch.cuda.empty_cache()
+
+latent_dim=87
+num_elements = len(train_loader.dataset)
+num_batches = len(train_loader)
+batch_size = train_loader.batch_size
+mu_out = torch.zeros(num_elements, latent_dim)
+logvar_out = torch.zeros(num_elements,latent_dim)
+recon_out = torch.zeros(num_elements,87*87)
+x_latent_out = torch.zeros(num_elements, 87)
+with torch.no_grad():
+    for i, (data) in enumerate(train_loader):
+        start = i*batch_size
+        end = start + batch_size
+        if i == num_batches - 1:
+            end = num_elements
+        data = data.to(device)
+        recon_batch, mu, logvar, x_latent = model(data)
+        mu_out[start:end] = mu
+        logvar_out[start:end] = logvar
+        x_latent_out[start:end] = x_latent
+        recon_out[start:end] =recon_batch
+
+with torch.no_grad():
+    sample = torch.randn(10, 68).to(device)
+    (sample,_) = model.decode(sample)
+    sample = sample.cpu()
+    for i in range(len(sample)):
+        plt.imshow(sample[i].reshape(68,68))
+        plt.savefig('results/{}.png'.format(i))
+
+np.save('mu.npy', mu_out.detach().numpy())
+import numpy, scipy.io
+scipy.io.savemat('mu.mat', mdict={'mu': mu_out.detach().numpy()})
+
+# torch.stack([torch.Tensor(i) for i in mu_stack])
