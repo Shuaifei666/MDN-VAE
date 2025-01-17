@@ -10,7 +10,7 @@ from torch.autograd import Variable
 import numpy as np
 import torch.utils.data as utils
 from torchvision.utils import save_image
-
+from scipy.linalg import sqrtm
 
 device = torch.device("cuda")
 
@@ -161,17 +161,11 @@ def test(epoch):
     print('====> Test set loss: {:.4f}'.format(test_loss))
 
 
-for epoch in range(5000):
+for epoch in range(500):
     train(epoch)
-    with torch.no_grad():
-        sample = torch.randn(16, 87).to(device)
-        sample = model.decode(sample)[0].cpu()
-        save_image(sample.view(16, 1, 87, 87),'results/sample_{}.png'.format(epoch))
 
 
 
-
-torch.cuda.empty_cache()
 
 latent_dim=87
 num_elements = len(train_loader.dataset)
@@ -194,16 +188,105 @@ with torch.no_grad():
         x_latent_out[start:end] = x_latent
         recon_out[start:end] =recon_batch
 
+from skimage.metrics import structural_similarity as ssim
+net_data_array = np.array(net_data).astype(np.float32)  
+
+batch_size = 64  
+data_loader = torch.utils.data.DataLoader(net_data_array, batch_size=batch_size)
+
+generated_matrices = []
+
+model.eval()
 with torch.no_grad():
-    sample = torch.randn(10, 68).to(device)
-    (sample,_) = model.decode(sample)
-    sample = sample.cpu()
-    for i in range(len(sample)):
-        plt.imshow(sample[i].reshape(68,68))
-        plt.savefig('results/{}.png'.format(i))
+    for batch_data in data_loader:
+        batch_data = batch_data.to(device)
+        recon_batch, _, _, _ = model(batch_data)
+        recon_batch = recon_batch.cpu().numpy()
+        for i in range(recon_batch.shape[0]):
+            generated_matrix = recon_batch[i].reshape(68, 68)
+            generated_matrices.append(generated_matrix)
 
-np.save('mu.npy', mu_out.detach().numpy())
-import numpy, scipy.io
-scipy.io.savemat('mu.mat', mdict={'mu': mu_out.detach().numpy()})
+generated_matrices = np.array(generated_matrices)
+print('Generated matrices shape:', generated_matrices.shape)
 
+
+real_matrices = net_data_array.reshape(-1, 68, 68)
+print('Real matrices shape:', real_matrices.shape)
+
+
+real_matrices = real_matrices.astype(np.float32)
+generated_matrices = generated_matrices.astype(np.float32)
+
+max_value = real_matrices.max()
+real_matrices /= max_value
+generated_matrices /= max_value
+
+
+def compute_mse(real_matrices, generated_matrices):
+    mse_values = ((real_matrices - generated_matrices) ** 2).mean(axis=(1, 2))
+    average_mse = mse_values.mean()
+    return average_mse
+
+mse_value = compute_mse(real_matrices, generated_matrices)
+print('Average MSE:', mse_value)
+
+
+def compute_psnr(real_matrices, generated_matrices, max_value=1.0):
+    mse_values = ((real_matrices - generated_matrices) ** 2).mean(axis=(1, 2))
+    psnr_values = np.where(mse_values == 0, np.inf, 20 * np.log10(max_value) - 10 * np.log10(mse_values))
+    average_psnr = psnr_values[np.isfinite(psnr_values)].mean()
+    return average_psnr
+
+psnr_value = compute_psnr(real_matrices, generated_matrices, max_value=1.0)
+print('Average PSNR:', psnr_value)
+
+def compute_ssim(real_matrices, generated_matrices):
+    ssim_values = []
+    for real_mat, gen_mat in zip(real_matrices, generated_matrices):
+        ssim_value = ssim(real_mat, gen_mat, data_range=1.0)
+        ssim_values.append(ssim_value)
+    average_ssim = np.mean(ssim_values)
+    return average_ssim
+
+average_ssim = compute_ssim(real_matrices, generated_matrices)
+print('Average SSIM:', average_ssim)
+def compute_spectral_features(matrix, k=None):
+    eigenvalues = np.linalg.eigvals(matrix)
+    eigenvalues = np.real(eigenvalues)
+    eigenvalues = np.sort(eigenvalues)[::-1]
+    if k is not None:
+        eigenvalues = eigenvalues[:k]
+    return eigenvalues
+
+def calculate_fid(mu1, sigma1, mu2, sigma2):
+    diff = mu1 - mu2
+    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
+    return fid
+
+k = 10
+
+real_features = []
+for matrix in real_matrices:
+    features = compute_spectral_features(matrix, k=k)
+    real_features.append(features)
+real_features = np.array(real_features)
+
+generated_features = []
+for matrix in generated_matrices:
+    features = compute_spectral_features(matrix, k=k)
+    generated_features.append(features)
+generated_features = np.array(generated_features)
+
+mu_real = np.mean(real_features, axis=0)
+sigma_real = np.cov(real_features, rowvar=False)
+
+mu_gen = np.mean(generated_features, axis=0)
+sigma_gen = np.cov(generated_features, rowvar=False)
+
+fid_value = calculate_fid(mu_real, sigma_real, mu_gen, sigma_gen)
+print('FID value:', fid_value)
+torch.cuda.empty_cache()
 # torch.stack([torch.Tensor(i) for i in mu_stack])
