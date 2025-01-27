@@ -408,35 +408,29 @@ def compute_graph_features(matrix):
     return features
 
 ef calculate_fid(features_real, features_generated):
-    # 计算均值和协方差矩阵
     mu_real = np.mean(features_real, axis=0)
     sigma_real = np.cov(features_real, rowvar=False)
 
     mu_gen = np.mean(features_generated, axis=0)
     sigma_gen = np.cov(features_generated, rowvar=False)
 
-    # 计算均值差的平方
     diff = mu_real - mu_gen
     mean_diff = diff.dot(diff)
 
-    # 计算协方差矩阵的平方根
+
     covmean = sqrtm(sigma_real.dot(sigma_gen))
-    # 处理可能的复数结果
+
     if np.iscomplexobj(covmean):
         covmean = covmean.real
 
-    # 计算 FID
     fid = mean_diff + np.trace(sigma_real + sigma_gen - 2 * covmean)
     return fid
 
-# 提取图论特征
 features_real = [compute_graph_features(matrix) for matrix in real_matrices]
 features_generated = [compute_graph_features(matrix) for matrix in generated_matrices]
 
-# 转换为 NumPy 数组
 features_real = np.array(features_real)
 features_generated = np.array(features_generated)
 
-# 计算 FID
 fid_value = calculate_fid(features_real, features_generated)
-print("图论特征方法的 FID 值：", fid_value)
+print("Graph FID Value:", fid_value)

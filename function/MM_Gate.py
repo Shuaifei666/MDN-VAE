@@ -3,284 +3,280 @@ import argparse
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
-from torchvision import datasets, transforms
-from tqdm import tqdm
-from scipy.io import loadmat
-from torch.autograd import Variable
 import numpy as np
 import torch.utils.data as utils
-from torchvision.utils import save_image
 import matplotlib.pyplot as plt
+from scipy.io import loadmat
+from skimage.metrics import structural_similarity as ssim
+import networkx as nx
 from scipy.linalg import sqrtm
 
 torch.manual_seed(11111)
-###Load data set
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+###################################
+# 1. Data Loading
+###################################
 dat_mat = loadmat('./data/HCP_subcortical_CMData_desikan.mat')
 tensor = dat_mat['loaded_tensor_sub']
 
-###Load the adjacentcy matrix
-A_mat = np.mean(np.squeeze(tensor[18:86, 18:86,1,:]), axis=2)
+A_mat = np.mean(np.squeeze(tensor[18:86, 18:86, 1, :]), axis=2)
 A_mat = A_mat + A_mat.transpose()
 
-
-
-### Choose the proper type of loss function 
 loss_type = "poisson"
-### If the loss_type = "poisson", set the proper offset for the mean
 offset = 200 
-### Set the neighborhood size for GATE
 n_size = 32
 
-
-### Load networks
 net_data = []
 for i in range(tensor.shape[3]):
-    ith = np.float32(tensor[:,:,0,i] + np.transpose(tensor[:,:,0,i]))
-    np.fill_diagonal(ith,np.mean(ith, 0))
+    ith = np.float32(tensor[:,:,0,i] + tensor[:,:,0,i].T)
+    np.fill_diagonal(ith, np.mean(ith, 0))
     ith = ith[18:86, 18:86]
     ith = ith.flatten()
-    ith = ith/offset
+    ith = ith / offset
     net_data.append(ith)
+net_data = np.array(net_data, dtype=np.float32)
+
+num_samples = len(net_data)
+train_size = int(0.8 * num_samples)
+test_size = num_samples - train_size
+train_data = net_data[:train_size]
+test_data = net_data[train_size:]
 
 batch_size = 256
-tensor_y = torch.stack([torch.Tensor(i) for i in net_data])
-y = utils.TensorDataset(tensor_y) # create your datset
-train_loader = utils.DataLoader(net_data, batch_size) 
-#train_loader = utils.DataLoader(y, batch_size, shuffle=True)
+train_dataset = utils.TensorDataset(torch.from_numpy(train_data))
+test_dataset = utils.TensorDataset(torch.from_numpy(test_data))
+train_loader = utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = utils.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
+###################################
+# 2. Build adjacency
+###################################
+def build_knn_adjacency(A_mat, k=32):
+    n_nodes = A_mat.shape[0]
+    adjacency = []
+    for u in range(n_nodes):
+        row = A_mat[u,:]
+        indices = np.argsort(row)[::-1]
+        topk = indices[:k]
+        topk = topk[topk != u]
+        topk = np.concatenate(([u], topk[:k-1]))
+        adjacency.append(topk)
+    return adjacency
 
+adjacency_list = build_knn_adjacency(A_mat, k=n_size)
+adjacency_list = [list(map(int, arr)) for arr in adjacency_list]
+adjacency_list = np.array(adjacency_list, dtype=object)
+print("Built adjacency with k=", n_size)
 
-def to_var(x, requires_grad=False, volatile=False):
-    """
-    Varialbe type that automatically choose cpu or cuda
-    """
-    if torch.cuda.is_available():
-        x = x.cuda()
-    return Variable(x, requires_grad=requires_grad, volatile=volatile)
+###################################
+# 3. GCNLayer
+###################################
+class GCNLayer(nn.Module):
+    def __init__(self, n_nodes=68, k=32):
+        super().__init__()
+        self.n_nodes = n_nodes
+        self.k = k
+        self.weight = nn.Parameter(torch.zeros(n_nodes, k))
+        nn.init.xavier_uniform_(self.weight)
+        self.bias = nn.Parameter(torch.zeros(n_nodes))
 
+    def forward(self, x_in, adjacency):
+        batch_size = x_in.shape[0]
+        x_out = torch.zeros_like(x_in)
+        for u in range(self.n_nodes):
+            nbh = adjacency[u]  
+            w_u = self.weight[u]  
+            x_nb = x_in[:, nbh]
+            val = (x_nb * w_u).sum(dim=1) + self.bias[u]
+            x_out[:, u] = val
+        return torch.sigmoid(x_out)
 
+###################################
+# 4. One channel with multiple GCN layers
+###################################
+class ChannelGCN(nn.Module):
+    def __init__(self, n_nodes=68, k=32, n_layers=3):
+        super().__init__()
+        self.n_layers = n_layers
+        self.layers = nn.ModuleList([GCNLayer(n_nodes, k) for _ in range(n_layers)])
+    
+    def forward(self, x_in, adjacency):
+        x = x_in
+        for layer in self.layers:
+            x = layer(x, adjacency)
+        return x 
 
-class GraphCNN(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True):
-        super(GraphCNN, self).__init__(in_features, out_features, bias)
-        self.mask_flag = False
-    def set_mask(self, mask):
-        self.mask = to_var(mask, requires_grad=False)
-        self.weight.data = self.weight.data*self.mask.data
-        self.mask_flag = True 
-    def get_mask(self):
-        print(self.mask_flag)
-        return self.mask
-    def forward(self, x):
-        if self.mask_flag == True:
-            weight = self.weight*self.mask
-            return F.linear(x, weight, self.bias)
-        else:
-            return F.linear(x, self.weight, self.bias)
+###################################
+# 5. Multi-Channel GCN Decoder
+###################################
+class MultiChannelGCNDecoder(nn.Module):
 
+    def __init__(self, R=5, n_nodes=68, k=32, n_layers=3, latent_dim=68):
+        super().__init__()
+        self.R = R
+        self.n_nodes = n_nodes
+        self.init_fc = nn.ModuleList([
+            nn.Linear(latent_dim, n_nodes) for _ in range(R)
+        ])
+        self.channel_gcns = nn.ModuleList([
+            ChannelGCN(n_nodes, k, n_layers) for _ in range(R)
+        ])
+        
+    def forward(self, z, adjacency):
+        batch_size = z.size(0)
+        sc_sum = 0
+        
+        for r in range(self.R):
+            x_r = self.init_fc[r](z)
+            x_r = self.channel_gcns[r](x_r, adjacency)
+            recon_r = torch.bmm(x_r.unsqueeze(2), x_r.unsqueeze(1))
+            sc_sum = sc_sum + recon_r
+        
+        sc_sum = 0.5*(sc_sum + sc_sum.transpose(1,2))
+        sc_flat = sc_sum.view(batch_size, -1)
+        return sc_flat
 
-
+###################################
+# 6. VAE
+###################################
 class VAE(nn.Module):
-    def __init__(self):
+    def __init__(self, R=5, n_nodes=68, k=32, n_layers=3, latent_dim=68):
         super(VAE, self).__init__()
-        latent_dim = 68
-        self.fc11 =  nn.Linear(68*68, 1024)
-        self.fc12 =  nn.Linear(68*68, 1024)
+        
+        self.fc11 = nn.Linear(n_nodes*n_nodes, 1024)
+        self.fc12 = nn.Linear(n_nodes*n_nodes, 1024)
         self.fc111 = nn.Linear(1024,128)
         self.fc222 = nn.Linear(1024,128)
         self.fc21 = nn.Linear(128, latent_dim)
         self.fc22 = nn.Linear(128, latent_dim)
-        self.fc3 = nn.Linear(latent_dim, 68)
-        self.fc32 = nn.Linear(latent_dim,68)
-        self.fc33 = nn.Linear(latent_dim,68)
-        self.fc34 = nn.Linear(latent_dim,68)
-        self.fc35 = nn.Linear(latent_dim,68)
-        self.fc4 = GraphCNN(68,68)
-        self.fc5 = GraphCNN(68,68)
-        self.fc6 = GraphCNN(68,68)
-        self.fc7 = GraphCNN(68,68)
-        self.fc8 = GraphCNN(68,68)
-        self.fcintercept = GraphCNN(68*68, 68*68)
+        
+        self.decoder = MultiChannelGCNDecoder(R=R, n_nodes=n_nodes, k=k,
+                                              n_layers=n_layers, latent_dim=latent_dim)
+    
     def encode(self, x):
         h11 = F.relu(self.fc11(x))
         h11 = F.relu(self.fc111(h11))
         h12 = F.relu(self.fc12(x))
         h12 = F.relu(self.fc222(h12))
         return self.fc21(h11), self.fc22(h12)
+    
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
         return mu + eps*std
-    def decode(self, z):
-        h31= F.sigmoid(self.fc3(z))
-        h31= F.sigmoid(self.fc4(h31))
-        h31_out = torch.bmm(h31.unsqueeze(2), h31.unsqueeze(1))
-        h32 = F.sigmoid(self.fc32(z))
-        h32 = F.sigmoid(self.fc5(h32))
-        h32_out = torch.bmm(h32.unsqueeze(2), h32.unsqueeze(1))
-        h33 = F.sigmoid(self.fc33(z))
-        h33 = F.sigmoid(self.fc6(h33))
-        h33_out = torch.bmm(h33.unsqueeze(2), h33.unsqueeze(1))
-        h34 = F.sigmoid(self.fc34(z))
-        h34 = F.sigmoid(self.fc7(h34))
-        h34_out = torch.bmm(h34.unsqueeze(2), h34.unsqueeze(1))
-        h35 = F.sigmoid(self.fc35(z))
-        h35 = F.sigmoid(self.fc8(h35))
-        h35_out = torch.bmm(h35.unsqueeze(2), h35.unsqueeze(1))
-        h30 = F.sigmoid(h31_out + h32_out + h33_out + h34_out+ h35_out)
-        h30 = h30.view(-1, 68*68)
-        h30 = self.fcintercept(h30)
-        # h30 =torch.exp(h30)
-        return h30.view(-1, 68*68), h31+h32+h33+h34
-    def forward(self, x):
-        mu, logvar = self.encode(x.view(-1, 68*68))
+    
+    def decode(self, z, adjacency):
+        return self.decoder(z, adjacency)
+    
+    def forward(self, x, adjacency):
+        x = x.view(-1, 68*68)
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        recon, x_latent = self.decode(z)
-        return recon.view(-1, 68*68), mu, logvar, x_latent
-    def set_mask(self, masks):
-        self.fc4.set_mask(masks[0])
-        self.fc5.set_mask(masks[1])
-        self.fc6.set_mask(masks[2])
-        self.fc7.set_mask(masks[3])
-        self.fc8.set_mask(masks[4])
-        self.fcintercept.set_mask(masks[5])
-
-
+        recon = self.decode(z, adjacency)
+        return recon, mu, logvar
 
 def loss_function(recon_x, x, mu, logvar):
-    # BCE = F.binary_cross_entropy(recon_x, x , reduction='sum')
-    BCE = F.poisson_nll_loss(recon_x , x, reduction='sum', log_input=True)
+    BCE = F.poisson_nll_loss(recon_x, x, reduction='sum', log_input=True)
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    # print(f"BCE (Poisson NLL): {BCE.item()}, KLD: {KLD.item()}")
     return BCE + KLD
 
+###################################
+# 7. Training / Testing
+###################################
+model = VAE(R=5, n_nodes=68, k=n_size, n_layers=3, latent_dim=68).to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+num_epochs = 500
+train_losses = []
 
+adjacency_list = build_knn_adjacency(A_mat, k=n_size)
+adjacency_list = [list(map(int, arr)) for arr in adjacency_list]
 
-def train(epoch):
+def train_epoch(epoch):
     model.train()
     train_loss = 0
-    for batch_idx, (data) in enumerate(train_loader):
+    for batch_idx, (data,) in enumerate(train_loader):
         data = data.to(device)
         optimizer.zero_grad()
-        recon_batch, mu, logvar, _ = model(data)
+        recon_batch, mu, logvar = model(data, adjacency_list)
         loss = loss_function(recon_batch, data, mu, logvar)
         loss.backward()
         train_loss += loss.item()
         optimizer.step()
-    print('====> Epoch: {} Average loss: {:.4f}'.format(
-          epoch, train_loss / len(train_loader.dataset)))
+    avg_train_loss = train_loss / len(train_loader.dataset)
+    print(f"Epoch: {epoch}, Avg loss: {avg_train_loss:.4f}")
+    return avg_train_loss
 
+for epoch in range(num_epochs):
+    avg_loss = train_epoch(epoch)
+    train_losses.append(avg_loss)
 
-def test(epoch):
-    model.eval()
-    test_loss = 0
-    with torch.no_grad():
-        for i, (data) in enumerate(train_loader):
-            data = data.to(device)
-            recon_batch, mu, logvar = model(data)
-            test_loss += loss_function(recon_batch, data, mu, logvar).item()
-    test_loss /= len(train_loader.dataset)
-    print('====> Test set loss: {:.4f}'.format(test_loss))
+plt.figure()
+plt.plot(range(num_epochs), train_losses, label='Training Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss')
+plt.legend()
+plt.savefig('training_loss_curve.png')
+plt.close()
 
-
-
-
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-model = VAE().to(device)
-masks = []
-mask_2NN = (np.argsort(np.argsort(A_mat, axis=-1),axis=-1)<n_size+1)
-masks.append(torch.from_numpy(np.float32(mask_2NN)).float())
-mask_4NN = (np.argsort(np.argsort(A_mat, axis=-1),axis=-1)<n_size+1)
-masks.append(torch.from_numpy(np.float32(mask_4NN)).float())
-mask_8NN = (np.argsort(np.argsort(A_mat, axis=-1),axis=-1)<n_size+1)
-masks.append(torch.from_numpy(np.float32(mask_8NN)).float())
-mask_16NN = (np.argsort(np.argsort(A_mat, axis=-1),axis=-1)<n_size+1)
-masks.append(torch.from_numpy(np.float32(mask_16NN)).float())
-mask_32NN = (np.argsort(np.argsort(A_mat, axis=-1),axis=-1)<n_size+1)
-masks.append(torch.from_numpy(np.float32(mask_32NN)).float())
-mask_intercept = np.identity(68*68)
-masks.append(torch.from_numpy(np.float32(mask_intercept)).float())
-model.set_mask(masks)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-batch_size = 256
-learning_rate=0.01
-
-
-for epoch in range(500):
-    # if epoch < 5:
-    #     model.fc11.requires_grad = False
-    #     model.fc21.requires_grad = False
-    # if epoch >= 5:
-    #     model.fc11.requires_grad = True
-    #     model.fc21.requires_grad = True
-    train(epoch)
-
-
-from skimage.metrics import structural_similarity as ssim
-net_data_array = np.array(net_data).astype(np.float32)  
-
-batch_size = 64  
-data_loader = torch.utils.data.DataLoader(net_data_array, batch_size=batch_size)
+# Test & evaluation
+model.eval()
+test_loader_for_metrics = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
 
 generated_matrices = []
+real_matrices = []
 
-model.eval()
 with torch.no_grad():
-    for batch_data in data_loader:
+    for (batch_data,) in test_loader_for_metrics:
         batch_data = batch_data.to(device)
-        recon_batch, _, _, _ = model(batch_data)
+        recon_batch, mu, logvar = model(batch_data, adjacency_list)
         recon_batch = recon_batch.cpu().numpy()
+        real_batch = batch_data.cpu().numpy()
         for i in range(recon_batch.shape[0]):
-            generated_matrix = recon_batch[i].reshape(68, 68)
-            generated_matrices.append(generated_matrix)
+            gen_mat = recon_batch[i].reshape(68,68)
+            generated_matrices.append(gen_mat)
+            real_mat = real_batch[i].reshape(68,68)
+            real_matrices.append(real_mat)
 
 generated_matrices = np.array(generated_matrices)
+real_matrices = np.array(real_matrices)
 print('Generated matrices shape:', generated_matrices.shape)
-
-
-real_matrices = net_data_array.reshape(-1, 68, 68)
 print('Real matrices shape:', real_matrices.shape)
 
 
-real_matrices = real_matrices.astype(np.float32)
-generated_matrices = generated_matrices.astype(np.float32)
-
 max_value = real_matrices.max()
-real_matrices /= max_value
-generated_matrices /= max_value
-if generated_matrices.min() < 0:
-    generated_matrices = np.maximum(generated_matrices, 0)
+real_matrices_norm = real_matrices / max_value
+generated_matrices_norm = generated_matrices / max_value
+generated_matrices_norm = np.maximum(generated_matrices_norm, 0)
 
-def compute_mse(real_matrices, generated_matrices):
-    mse_values = ((real_matrices - generated_matrices) ** 2).mean(axis=(1, 2))
-    average_mse = mse_values.mean()
-    return average_mse
+def compute_mse(r, g):
+    mse_values = ((r - g)**2).mean(axis=(1,2))
+    return mse_values.mean()
 
-mse_value = compute_mse(real_matrices, generated_matrices)
+mse_value = compute_mse(real_matrices_norm, generated_matrices_norm)
 print('Average MSE:', mse_value)
 
+def compute_psnr(r, g, max_value=1.0):
+    mse_values = ((r - g)**2).mean(axis=(1,2))
+    psnr_values = np.where(mse_values == 0, np.inf,
+                           20 * np.log10(max_value) - 10 * np.log10(mse_values))
+    return psnr_values[np.isfinite(psnr_values)].mean()
 
-def compute_psnr(real_matrices, generated_matrices, max_value=1.0):
-    mse_values = ((real_matrices - generated_matrices) ** 2).mean(axis=(1, 2))
-    psnr_values = np.where(mse_values == 0, np.inf, 20 * np.log10(max_value) - 10 * np.log10(mse_values))
-    average_psnr = psnr_values[np.isfinite(psnr_values)].mean()
-    return average_psnr
-
-psnr_value = compute_psnr(real_matrices, generated_matrices, max_value=1.0)
+psnr_value = compute_psnr(real_matrices_norm, generated_matrices_norm, max_value=1.0)
 print('Average PSNR:', psnr_value)
 
-def compute_ssim(real_matrices, generated_matrices):
+def compute_ssim_average(r, g):
     ssim_values = []
-    for real_mat, gen_mat in zip(real_matrices, generated_matrices):
-        ssim_value = ssim(real_mat, gen_mat, data_range=1.0)
+    for rm, gm in zip(r, g):
+        ssim_value = ssim(rm, gm, data_range=1.0)
         ssim_values.append(ssim_value)
-    average_ssim = np.mean(ssim_values)
-    return average_ssim
+    return np.mean(ssim_values)
 
-average_ssim = compute_ssim(real_matrices, generated_matrices)
+average_ssim = compute_ssim_average(real_matrices_norm, generated_matrices_norm)
 print('Average SSIM:', average_ssim)
 
+from scipy.linalg import sqrtm
 def compute_spectral_features(matrix, k=None):
     eigenvalues = np.linalg.eigvals(matrix)
     eigenvalues = np.real(eigenvalues)
@@ -297,118 +293,73 @@ def calculate_fid(mu1, sigma1, mu2, sigma2):
     fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
     return fid
 
-k = 30
-
+k_spectral = 30
 real_features = []
-for matrix in real_matrices:
-    features = compute_spectral_features(matrix, k=k)
+for matrix in real_matrices_norm:
+    features = compute_spectral_features(matrix, k=k_spectral)
     real_features.append(features)
 real_features = np.array(real_features)
 
 generated_features = []
-for matrix in generated_matrices:
-    features = compute_spectral_features(matrix, k=k)
+for matrix in generated_matrices_norm:
+    features = compute_spectral_features(matrix, k=k_spectral)
     generated_features.append(features)
 generated_features = np.array(generated_features)
 
 mu_real = np.mean(real_features, axis=0)
 sigma_real = np.cov(real_features, rowvar=False)
-
 mu_gen = np.mean(generated_features, axis=0)
 sigma_gen = np.cov(generated_features, rowvar=False)
 
-fid_value = calculate_fid(mu_real, sigma_real, mu_gen, sigma_gen)
-print('FID 值:', fid_value)
+fid_spectral = calculate_fid(mu_real, sigma_real, mu_gen, sigma_gen)
+print('Spectral FID:', fid_spectral)
 
-
-import numpy as np
 import networkx as nx
-from scipy.linalg import sqrtm
-
 def compute_graph_features(matrix):
-    # 矩阵归一化
-    max_value = matrix.max()
-    if max_value > 0:
-        matrix_normalized = matrix / max_value
+    max_val = np.max(np.abs(matrix))
+    if max_val > 0:
+        matrix_normalized = matrix / max_val
     else:
         matrix_normalized = np.zeros_like(matrix)
-
-    # 将连接强度转换为距离
     epsilon = 1e-5
-    distance_matrix = 1 / (matrix_normalized + epsilon)
-
-    # 创建加权图
+    distance_matrix = 1/(matrix_normalized+epsilon)
     G = nx.from_numpy_array(matrix_normalized)
-
-    # 计算加权度数
     degrees = np.array([val for (node, val) in G.degree(weight='weight')])
     degree_mean = degrees.mean()
     degree_std = degrees.std()
-
-    # 计算加权聚类系数
     clustering_coeffs = np.array(list(nx.clustering(G, weight='weight').values()))
     clustering_mean = clustering_coeffs.mean()
     clustering_std = clustering_coeffs.std()
-
-    # 添加边的距离属性
-    edge_distances = {}
-    for i, j in G.edges():
-        edge_distances[(i, j)] = distance_matrix[i, j]
-    nx.set_edge_attributes(G, edge_distances, 'distance')
-
-    # 计算加权平均最短路径长度
     try:
         avg_shortest_path_length = nx.average_shortest_path_length(G, weight='distance')
     except nx.NetworkXError:
-        # 处理不连通图的情况
         lengths = []
         for component in nx.connected_components(G):
             subgraph = G.subgraph(component)
-            if len(subgraph) > 1:
+            if len(subgraph)>1:
                 length = nx.average_shortest_path_length(subgraph, weight='distance')
                 lengths.append(length)
         avg_shortest_path_length = np.mean(lengths) if lengths else 0
-
-    # 特征向量
-    features = np.array([
-        degree_mean,
-        degree_std,
-        clustering_mean,
-        clustering_std,
-        avg_shortest_path_length
-    ])
+    features = np.array([degree_mean, degree_std, clustering_mean, clustering_std, avg_shortest_path_length])
     return features
 
-def calculate_fid(features_real, features_generated):
-    # 计算均值和协方差矩阵
+def calculate_fid_graph(features_real, features_generated):
     mu_real = np.mean(features_real, axis=0)
     sigma_real = np.cov(features_real, rowvar=False)
-
     mu_gen = np.mean(features_generated, axis=0)
     sigma_gen = np.cov(features_generated, rowvar=False)
-
-    # 计算均值差的平方
     diff = mu_real - mu_gen
     mean_diff = diff.dot(diff)
-
-    # 计算协方差矩阵的平方根
     covmean = sqrtm(sigma_real.dot(sigma_gen))
-    # 处理可能的复数结果
     if np.iscomplexobj(covmean):
         covmean = covmean.real
-
-    # 计算 FID
     fid = mean_diff + np.trace(sigma_real + sigma_gen - 2 * covmean)
     return fid
 
-# 提取图论特征
-features_real = [compute_graph_features(matrix) for matrix in real_matrices]
-features_generated = [compute_graph_features(matrix) for matrix in generated_matrices]
+features_real_graph = [compute_graph_features(m) for m in real_matrices_norm]
+features_generated_graph = [compute_graph_features(m) for m in generated_matrices_norm]
+features_real_graph = np.array(features_real_graph)
+features_generated_graph = np.array(features_generated_graph)
 
-# 转换为 NumPy 数组
-features_real = np.array(features_real)
-features_generated = np.array(features_generated)
-
-# 计算 FID
-fid_value = calculate_fid(features_real, features_generated)
-print("图论特征方法的 FID 值：", fid_value)
+fid_graph = calculate_fid_graph(features_real_graph, features_generated_graph)
+print("Graph FID:", fid_graph)

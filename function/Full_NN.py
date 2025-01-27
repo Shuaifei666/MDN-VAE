@@ -168,11 +168,7 @@ test_losses = []
 for epoch in range(num_epochs):
     avg_train_loss = train_epoch(epoch)
     train_losses.append(avg_train_loss)
-    # 如需定期测试集验证，可在此处调用 test_epoch(epoch)
-    # test_loss = test_epoch(epoch)
-    # test_losses.append(test_loss)
 
-# 绘制训练loss随epoch的变化曲线
 plt.figure()
 plt.plot(range(num_epochs), train_losses, label='Training Loss')
 plt.xlabel('Epoch')
@@ -182,7 +178,6 @@ plt.legend()
 plt.savefig('/home/yifzhang/Project/MDN_VAE/plot/fullnn_training_loss_curve.png')
 plt.close()
 
-# 计算测试集上的指标
 model.eval()
 test_data_array = test_data.astype(np.float32)
 test_loader_for_metrics = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
@@ -196,7 +191,6 @@ with torch.no_grad():
         recon_batch, _, _, _ = model(batch_data)
         recon_batch = recon_batch.cpu().numpy()
 
-        # 注意这里的维度是87x87
         for i in range(recon_batch.shape[0]):
             generated_matrix = recon_batch[i].reshape(87, 87)
             generated_matrices.append(generated_matrix)
@@ -212,7 +206,6 @@ real_matrices = np.array(real_matrices)
 print('Generated matrices shape:', generated_matrices.shape)
 print('Real matrices shape:', real_matrices.shape)
 
-# 归一化处理与负值截断（如果有必要，这里不需要截断，因为log(ith+1)应该都是>=0）
 max_value = real_matrices.max()
 real_matrices_norm = real_matrices / max_value
 generated_matrices_norm = generated_matrices / max_value

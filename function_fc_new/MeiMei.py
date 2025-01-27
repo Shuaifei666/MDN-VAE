@@ -215,7 +215,7 @@ model = VAE().to(device)
 
 
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
-num_epochs = 50
+num_epochs = 500
 train_losses = []
 
 def train_epoch(epoch):

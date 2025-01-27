@@ -19,12 +19,10 @@ import numpy as np
 torch.manual_seed(11111)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 加载FC数据集
 dat_mat = loadmat('./data/desikan_fc_all.mat')
 all_fc_data = dat_mat['all_fc'] 
 fc_list = all_fc_data[0]
 
-# 筛选出形状为(87,87)的FC矩阵
 filtered_fc = [mat for mat in fc_list if mat.shape == (87,87)]
 
 tensor = np.stack(filtered_fc, axis=-1)
@@ -32,7 +30,6 @@ print("Tensor shape:", tensor.shape)  # (87,87,N)
 
 A_mat = np.mean(tensor[18:86, 18:86, :], axis=2)
 
-# 将FC从[-1,1]映射到[0,1]
 net_data = []
 for i in range(tensor.shape[2]):
     ith = np.float32(tensor[:,:,i] + tensor[:,:,i].T)

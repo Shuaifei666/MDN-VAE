@@ -225,7 +225,7 @@ for epoch in range(num_epochs):
     avg_loss = train_epoch(epoch)
     train_losses.append(avg_loss)
 
-# 绘制训练loss随epoch的变化曲线并保存
+
 plt.figure()
 plt.plot(range(num_epochs), train_losses, label='Training Loss')
 plt.xlabel('Epoch')
@@ -235,7 +235,7 @@ plt.legend()
 plt.savefig('/home/yifzhang/Project/MDN_VAE/plot/training_loss_curve.png')
 plt.close()
 
-# 使用测试集计算指标
+
 model.eval()
 test_data_array = test_data.astype(np.float32)
 
@@ -402,6 +402,6 @@ features_real = np.array(features_real)
 features_generated = np.array(features_generated)
 
 fid_graph_value = calculate_fid_graph(features_real, features_generated)
-print("图论特征方法的 FID 值：", fid_graph_value)
+print("Graph FID Value:", fid_graph_value)
 
 torch.cuda.empty_cache()

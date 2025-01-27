@@ -411,6 +411,6 @@ features_real = np.array(features_real)
 features_generated = np.array(features_generated)
 
 fid_graph_value = calculate_fid_graph(features_real, features_generated)
-print("图论特征方法的 FID 值：", fid_graph_value)
+print("Graph FID Value:", fid_graph_value)
 
 torch.cuda.empty_cache()
